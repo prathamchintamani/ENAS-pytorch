@@ -1,10 +1,9 @@
-ipdb
-tqdm
-scipy==1.2.1
-imageio
-pygraphviz
-torch
-torchvision
-tensorboardX
-Pillow
-opencv-contrib-python
+ipdb==0.13.9
+tqdm==4.66.1
+scipy==1.10.1
+imageio==2.31.0
+pygraphviz==1.7
+# Do not list torch/torchvision here; install them via the command below
+tensorboardX==2.6.2
+Pillow==9.5.0
+opencv-contrib-python==4.8.0.74

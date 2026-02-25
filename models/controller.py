@@ -1,115 +1,59 @@
 """A module with NAS controller-related code."""
 import collections
 import os
-
 import torch
 import torch.nn.functional as F
-
 import utils
 from utils import Node
 
-
 def _construct_dags(prev_nodes, activations, func_names, num_blocks):
-    """Constructs a set of DAGs based on the actions, i.e., previous nodes and
-    activation functions, sampled from the controller/policy pi.
-
-    Args:
-        prev_nodes: Previous node actions from the policy.
-        activations: Activations sampled from the policy.
-        func_names: Mapping from activation function names to functions.
-        num_blocks: Number of blocks in the target RNN cell.
-
-    Returns:
-        A list of DAGs defined by the inputs.
-
-    RNN cell DAGs are represented in the following way:
-
-    1. Each element (node) in a DAG is a list of `Node`s.
-
-    2. The `Node`s in the list dag[i] correspond to the subsequent nodes
-       that take the output from node i as their own input.
-
-    3. dag[-1] is the node that takes input from x^{(t)} and h^{(t - 1)}.
-       dag[-1] always feeds dag[0].
-       dag[-1] acts as if `w_xc`, `w_hc`, `w_xh` and `w_hh` are its
-       weights.
-
-    4. dag[N - 1] is the node that produces the hidden state passed to
-       the next timestep. dag[N - 1] is also always a leaf node, and therefore
-       is always averaged with the other leaf nodes and fed to the output
-       decoder.
+    """
+    Constructs a List-based DAG for the Shared CNN.
+    
+    The child model's _resolve_dag expects a List of Node objects.
+    Because shared_cnn.py handles the linear chain logic internally,
+    we only need to provide the operation names for each node id.
     """
     dags = []
     for nodes, func_ids in zip(prev_nodes, activations):
-        dag = collections.defaultdict(list)
-
-        # add first node
-        dag[-1] = [Node(0, func_names[func_ids[0]])]
-        dag[-2] = [Node(0, func_names[func_ids[0]])]
-
-        # add following nodes
-        for jdx, (idx, func_id) in enumerate(zip(nodes, func_ids[1:])):
-            dag[utils.to_item(idx)].append(Node(jdx + 1, func_names[func_id]))
-
-        leaf_nodes = set(range(num_blocks)) - dag.keys()
-
-        # merge with avg
-        for idx in leaf_nodes:
-            dag[idx] = [Node(num_blocks, 'avg')]
-
-        # TODO(brendan): This is actually y^{(t)}. h^{(t)} is node N - 1 in
-        # the graph, where N Is the number of nodes. I.e., h^{(t)} takes
-        # only one other node as its input.
-        # last h[t] node
-        last_node = Node(num_blocks + 1, 'h[t]')
-        dag[num_blocks] = [last_node]
-        dags.append(dag)
-
+        dag_list = []
+        
+        for i in range(num_blocks):
+            # Convert tensor index to python scalar
+            op_id = utils.to_item(func_ids[i])
+            op_name = func_names[op_id]
+            
+            # shared_cnn.py uses the 'name' attribute to look up the operation
+            dag_list.append(Node(id=i, name=op_name))
+            
+        dags.append(dag_list)
     return dags
 
 
 class Controller(torch.nn.Module):
-    """Based on
-    https://github.com/pytorch/examples/blob/master/word_language_model/model.py
-
-    TODO(brendan): RL controllers do not necessarily have much to do with
-    language models.
-
-    Base the controller RNN on the GRU from:
-    https://github.com/ikostrikov/pytorch-a2c-ppo-acktr/blob/master/model.py
-    """
     def __init__(self, args):
-        torch.nn.Module.__init__(self)
+        super(Controller, self).__init__()
         self.args = args
 
         if self.args.network_type == 'rnn':
-            # NOTE(brendan): `num_tokens` here is just the activation function
-            # for every even step,
             self.num_tokens = [len(args.shared_rnn_activations)]
             for idx in range(self.args.num_blocks):
-                self.num_tokens += [idx + 1,
-                                    len(args.shared_rnn_activations)]
+                self.num_tokens += [idx + 1, len(args.shared_rnn_activations)]
             self.func_names = args.shared_rnn_activations
         elif self.args.network_type == 'cnn':
-            self.num_tokens = [len(args.shared_cnn_types),
-                               self.args.num_blocks]
+            # For the current SharedCNN micro-search, we sample one op per node.
+            # This creates a decoder for each of the nodes in the cell.
+            self.num_tokens = [len(args.shared_cnn_types)] * self.args.num_blocks
             self.func_names = args.shared_cnn_types
 
         num_total_tokens = sum(self.num_tokens)
 
-        self.encoder = torch.nn.Embedding(num_total_tokens,
-                                          args.controller_hid)
+        self.encoder = torch.nn.Embedding(num_total_tokens, args.controller_hid)
         self.lstm = torch.nn.LSTMCell(args.controller_hid, args.controller_hid)
 
-        # TODO(brendan): Perhaps these weights in the decoder should be
-        # shared? At least for the activation functions, which all have the
-        # same size.
-        self.decoders = []
-        for idx, size in enumerate(self.num_tokens):
-            decoder = torch.nn.Linear(args.controller_hid, size)
-            self.decoders.append(decoder)
-
-        self._decoders = torch.nn.ModuleList(self.decoders)
+        self.decoders = torch.nn.ModuleList()
+        for size in self.num_tokens:
+            self.decoders.append(torch.nn.Linear(args.controller_hid, size))
 
         self.reset_parameters()
         self.static_init_hidden = utils.keydefaultdict(self.init_hidden)
@@ -129,14 +73,13 @@ class Controller(torch.nn.Module):
         for decoder in self.decoders:
             decoder.bias.data.fill_(0)
 
-    def forward(self,  # pylint:disable=arguments-differ
-                inputs,
-                hidden,
-                block_idx,
-                is_embed):
+    def forward(self, inputs, hidden, block_idx, is_embed):
         if not is_embed:
+            # inputs is a LongTensor of indices [Batch]
+            # encoder turns indices into vectors [Batch, HID]
             embed = self.encoder(inputs)
         else:
+            # inputs is already a hidden-sized vector (initial zeros)
             embed = inputs
 
         hx, cx = self.lstm(embed, hidden)
@@ -144,33 +87,27 @@ class Controller(torch.nn.Module):
 
         logits /= self.args.softmax_temperature
 
-        # exploration
         if self.args.mode == 'train':
-            logits = (self.args.tanh_c*F.tanh(logits))
+            logits = (self.args.tanh_c * torch.tanh(logits))
 
         return logits, (hx, cx)
 
     def sample(self, batch_size=1, with_details=False, save_dir=None):
-        """Samples a set of `args.num_blocks` many computational nodes from the
-        controller, where each node is made up of an activation function, and
-        each node except the last also includes a previous node.
-        """
         if batch_size < 1:
             raise Exception(f'Wrong batch_size: {batch_size} < 1')
 
-        # [B, L, H]
+        # [Batch, HID]
         inputs = self.static_inputs[batch_size]
         hidden = self.static_init_hidden[batch_size]
 
         activations = []
         entropies = []
         log_probs = []
-        prev_nodes = []
-        # NOTE(brendan): The RNN controller alternately outputs an activation,
-        # followed by a previous node, for each block except the last one,
-        # which only gets an activation function. The last node is the output
-        # node, and its previous node is the average of all leaf nodes.
-        for block_idx in range(2*(self.args.num_blocks - 1) + 1):
+        prev_nodes = [] # Kept for interface parity, though not used for linear CNNs
+
+        for block_idx in range(len(self.num_tokens)):
+            # First step uses the zero-vector (is_embed=True)
+            # Subsequent steps use the action index (is_embed=False)
             logits, hidden = self.forward(inputs,
                                           hidden,
                                           block_idx,
@@ -178,41 +115,36 @@ class Controller(torch.nn.Module):
 
             probs = F.softmax(logits, dim=-1)
             log_prob = F.log_softmax(logits, dim=-1)
-            # TODO(brendan): .mean() for entropy?
             entropy = -(log_prob * probs).sum(1, keepdim=False)
 
             action = probs.multinomial(num_samples=1).data
             selected_log_prob = log_prob.gather(
                 1, utils.get_variable(action, requires_grad=False))
 
-            # TODO(brendan): why the [:, 0] here? Should it be .squeeze(), or
-            # .view()? Same below with `action`.
             entropies.append(entropy)
             log_probs.append(selected_log_prob[:, 0])
 
-            # 0: function, 1: previous node
-            mode = block_idx % 2
+            # Prepare the next input: shift index to unique embedding space for each block
             inputs = utils.get_variable(
-                action[:, 0] + sum(self.num_tokens[:mode]),
+                action[:, 0] + sum(self.num_tokens[:block_idx]),
                 requires_grad=False)
 
-            if mode == 0:
-                activations.append(action[:, 0])
-            elif mode == 1:
-                prev_nodes.append(action[:, 0])
+            activations.append(action[:, 0])
 
-        prev_nodes = torch.stack(prev_nodes).transpose(0, 1)
+        # Stack sampled operations
         activations = torch.stack(activations).transpose(0, 1)
+        
+        # In this linear mode, prev_nodes are not sampled but inferred in _construct_dags
+        fake_prev_nodes = [torch.zeros(batch_size)] * self.args.num_blocks
 
-        dags = _construct_dags(prev_nodes,
+        dags = _construct_dags(fake_prev_nodes,
                                activations,
                                self.func_names,
                                self.args.num_blocks)
 
         if save_dir is not None:
             for idx, dag in enumerate(dags):
-                utils.draw_network(dag,
-                                   os.path.join(save_dir, f'graph{idx}.png'))
+                utils.draw_network(dag, os.path.join(save_dir, f'graph{idx}.png'))
 
         if with_details:
             return dags, torch.cat(log_probs), torch.cat(entropies)

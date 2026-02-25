@@ -37,7 +37,7 @@ net_arg.add_argument('--shared_rnn_max_length', type=int, default=35)
 net_arg.add_argument('--shared_rnn_activations', type=eval,
                      default="['tanh', 'ReLU', 'identity', 'sigmoid']")
 net_arg.add_argument('--shared_cnn_types', type=eval,
-                     default="['3x3', '5x5', 'sep 3x3', 'sep 5x5', 'max 3x3', 'max 5x5']")
+                     default="['conv3x3', 'conv5x5', 'sep_conv3x3', 'sep_conv5x5', 'max_pool3x3', 'avg_pool3x3']")
 
 # PTB regularizations
 net_arg.add_argument('--activation_regularization',
@@ -67,6 +67,7 @@ net_arg.add_argument('--cnn_hid', type=int, default=64)
 # Data
 data_arg = add_argument_group('Data')
 data_arg.add_argument('--dataset', type=str, default='ptb')
+data_arg.add_argument('--num_workers', type=int, default=4, help='number of data loading threads')
 
 
 # Training / test parameters

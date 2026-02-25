@@ -18,16 +18,22 @@ from PIL import ImageFont
 from PIL import ImageDraw 
 
 
-try:
-    import scipy.misc
-    imread = scipy.misc.imread
-    imresize = scipy.misc.imresize
-    imsave = imwrite = scipy.misc.imsave
-except:
-    import cv2
-    imread = cv2.imread
-    imresize = cv2.imresize
-    imsave = imwrite = cv2.imwrite
+import cv2
+import numpy as np
+import imageio
+
+from collections import namedtuple
+Node = namedtuple('Node', ['id', 'name'])
+
+# Replace the failing scipy/cv2 logic with this:
+def imread(path):
+    return imageio.imread(path)
+
+def imresize(img, size):
+    # size usually comes as (height, width) or (width, height)
+    # cv2.resize expects (width, height)
+    return cv2.resize(img, (size[1], size[0]), interpolation=cv2.INTER_LINEAR)
+imsave = imwrite = cv2.imwrite
 
 
 ##########################
